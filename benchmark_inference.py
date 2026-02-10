@@ -2,7 +2,6 @@ import argparse
 import time
 from pathlib import Path
 
-import joblib
 import numpy as np
 import onnxruntime as ort
 import pandas as pd
@@ -10,99 +9,111 @@ from sklearn.metrics import classification_report
 
 
 def load_dataset(csv_path: Path, n_rows: int = 2000):
+    """
+    Загружает датасет из CSV-файла, предполагая наличие столбца 'target' для меток.
+    Возвращает признаки (X) и метки (y) в виде массивов NumPy.
+    """
     df = pd.read_csv(csv_path, nrows=n_rows)
     if "target" not in df.columns:
-        raise ValueError("В наборе данных отсутствует колонка 'target'")
-    x = df.drop(columns=["target"]).to_numpy(dtype=float)
+        raise ValueError("В датасете должен быть столбец 'target' для меток.")
+    X = df.drop(columns=["target"]).to_numpy(dtype=np.float32)
     y = df["target"].to_numpy()
-    return x, y
+    return X, y
 
 
-def benchmark_sklearn(model_path: Path, x: np.ndarray, y: np.ndarray, runs: int = 20):
-    model = joblib.load(model_path)
-    start = time.perf_counter()
-    for _ in range(runs):
-        preds = model.predict(x)
-    elapsed = time.perf_counter() - start
-    avg_time = elapsed / runs
-
-    report = classification_report(y, preds, digits=4)
-    return avg_time, report
-
-
-def benchmark_onnx(onnx_path: Path, x: np.ndarray, y: np.ndarray, runs: int = 20):
+def benchmark_onnx(onnx_path: Path, X: np.ndarray, y: np.ndarray, runs: int = 20):
+    """
+    Бенчмаркинг ONNX-модели: измеряет среднее время инференса и генерирует отчет классификации.
+    Предполагает бинарную классификацию с сигмоидным выходом или мультиклассовую с softmax.
+    """
     session = ort.InferenceSession(
-        onnx_path.as_posix(),
+        str(onnx_path),
         providers=["CPUExecutionProvider"],
     )
     input_name = session.get_inputs()[0].name
 
     start = time.perf_counter()
     for _ in range(runs):
-        raw = session.run(None, {input_name: x.astype("float32")})[0]
+        raw_output = session.run(None, {input_name: X})[0]
     elapsed = time.perf_counter() - start
     avg_time = elapsed / runs
 
-    if raw.ndim == 2 and raw.shape[1] >= 2:
-        preds_labels = np.argmax(raw, axis=1)
+    # Обработка выхода: предполагаем бинарный (сигмоид) или мультиклассовый (argmax)
+    if raw_output.ndim == 2 and raw_output.shape[1] > 1:
+        preds = np.argmax(raw_output, axis=1)
     else:
-        preds_labels = (raw > 0.5).astype(int).ravel()
+        preds = (raw_output.ravel() > 0.5).astype(int)
 
-    report = classification_report(y, preds_labels, digits=4)
+    report = classification_report(y, preds, digits=4)
     return avg_time, report
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    Разбор аргументов командной строки для бенчмаркинга ONNX-моделей.
+    """
     parser = argparse.ArgumentParser(
-        description=(
-            "Анализ производительности и точности моделей sklearn и ONNX "
-            "на идентичном наборе данных"
-        ),
+        description="Бенчмаркинг и сравнение двух ONNX-моделей (например, оригинальной и квантованной) на одном датасете.",
     )
     parser.add_argument(
         "--data",
         type=Path,
         required=True,
-        help="Файл CSV с тестовыми примерами",
+        help="Путь к CSV-файлу с тестовыми данными, содержащему столбец 'target'.",
     )
     parser.add_argument(
-        "--model",
-        type=Path,
-        default=Path("models/model_default.pkl"),
-        help="Расположение файла модели sklearn",
-    )
-    parser.add_argument(
-        "--onnx",
+        "--original-onnx",
         type=Path,
         default=Path("models/default_model.onnx"),
-        help="Расположение файла ONNX-модели",
+        help="Путь к оригинальной ONNX-модели.",
+    )
+    parser.add_argument(
+        "--quantized-onnx",
+        type=Path,
+        default=Path("models/default_model_int.onnx"),
+        help="Путь к квантованной ONNX-модели.",
     )
     parser.add_argument(
         "--report-dir",
         type=Path,
         default=Path("reports"),
-        help="Директория для хранения текстовых отчетов",
+        help="Каталог для сохранения файлов отчетов бенчмаркинга.",
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=20,
+        help="Количество запусков инференса для усреднения времени.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
+    """
+    Основная функция для запуска сравнительного бенчмаркинга.
+    """
     args = parse_args()
-    x, y = load_dataset(args.data)
+    X, y = load_dataset(args.data)
 
     report_dir = args.report_dir
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    sk_time, sk_report = benchmark_sklearn(args.model, x, y)
-    onnx_time, onnx_report = benchmark_onnx(args.onnx, x, y)
+    # Бенчмаркинг оригинальной модели
+    orig_time, orig_report = benchmark_onnx(args.original_onnx, X, y, runs=args.runs)
+    
+    # Бенчмаркинг квантованной модели
+    quant_time, quant_report = benchmark_onnx(args.quantized_onnx, X, y, runs=args.runs)
 
-    print(f"Среднее время предсказания sklearn: {sk_time:.6f} сек")
-    print(f"Среднее время предсказания ONNX: {onnx_time:.6f} сек")
-    if onnx_time > 0:
-        print(f"Коэффициент сравнения sklearn / ONNX: {sk_time / onnx_time:.2f}x")
+    print(f"Среднее время инференса для оригинальной ONNX: {orig_time:.6f} сек")
+    print(f"Среднее время инференса для квантованной ONNX: {quant_time:.6f} сек")
+    if quant_time > 0:
+        speedup = orig_time / quant_time
+        print(f"Ускорение (оригинальная / квантованная): {speedup:.2f}x")
 
-    (report_dir / "benchmark_sklearn.txt").write_text(sk_report, encoding="utf-8")
-    (report_dir / "benchmark_onnx.txt").write_text(onnx_report, encoding="utf-8")
+    # Сохранение отчетов
+    (report_dir / "benchmark_original_onnx.txt").write_text(orig_report, encoding="utf-8")
+    (report_dir / "benchmark_quantized_onnx.txt").write_text(quant_report, encoding="utf-8")
+    print(f"Отчеты сохранены в {report_dir}")
 
 
 if __name__ == "__main__":
